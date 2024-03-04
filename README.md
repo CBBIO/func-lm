@@ -1,1 +1,6 @@
-additional data for the paper here https://zenodo.org/records/10659694
+This repo contains the supp tables from our preprint 
+https://www.biorxiv.org/content/10.1101/2024.02.14.580341v1
+Code is coming soon enough
+
+a.rojas.m@csic.es
+
