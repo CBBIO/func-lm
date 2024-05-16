@@ -1,0 +1,224 @@
+---
+title: "Semantic Sim Report"
+output:
+  html_document:
+    df_print: paged
+params:
+  species: "YEAST"
+  db: "org.Sc.sgd.db"
+---
+
+```{=html}
+<!---
+
+para crear el report: 
+rmarkdown::render( "main scripts/ss_report.Rmd",output_file = "report_ss_DROME.html",params=list(species="DROME",db="org.Dm.eg.db")) 
+-->
+```
+
+## Semantic Similarity
+
+```{r}
+library(tidyverse)
+library(furrr)
+library(GO.db)
+library(params$db,character.only=TRUE)
+library(GOSemSim)
+knitr::opts_chunk$set(
+  echo = F, warning = F, error = F,message = F,cache=TRUE,cache.lazy = FALSE
+)
+
+
+furrr_options(globals = TRUE,  seed = T)
+plan(strategy = 'multisession', workers = 10)
+
+theme_set(theme_light()+theme(strip.text=element_text(size=20),axis.text=element_text(size=15),axis.title=element_text(size=15),legend.text=element_text(size=15),legend.title=element_text(size=15)))
+
+method_colors<- c("#999999","#999999","#56B4E9", "#009E73","#009E73", "#E69F00")
+
+options(ggplot2.discrete.fill= method_colors)
+```
+
+
+```{r}
+
+load(paste0("../big_tables/super_big_table_",params$species,".Rdata"))
+
+select(GO.db,keys = keys(GO.db),columns = c("TERM","ONTOLOGY"))  %>%
+  mutate(ONTOLOGY=case_when(ONTOLOGY == 'BP' ~ "Biological Process",
+                            ONTOLOGY == 'MF' ~ "Molecular Function",
+                            ONTOLOGY == 'CC' ~ "Cellular Component")) -> terms
+
+gold_files<-dir(path='../gold',pattern=paste0(params$species,"_"),full.names = T)
+
+gold<-map_dfr(gold_files,read_delim,delim=';',col_names=c('UNIPROT_ID','GOID')) %>%
+  separate_longer_delim(cols = GOID,delim = "|") %>% 
+  left_join(terms) 
+
+gold<-gold%>% filter(!is.na(TERM))
+
+super_big_table %>% 
+  dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID.pred,TERM.pred,results) %>%
+  mutate(val = TRUE) %>%
+  pivot_wider(names_from = results,values_from = val , values_fn = all ,values_fill = FALSE) %>% 
+  dplyr::select(-`NO RELATION`) %>% 
+  mutate("UNRELATED" = !(HIT | PARENT | CHILD | ANCESTOR | OFFSPRING)) -> summary_predictions
+
+summary_predictions <-summary_predictions %>% filter(!is.na(method))
+
+summary_predictions %>% 
+  dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID=GOID.pred,TERM=TERM.pred) %>% 
+  bind_rows(gold %>% mutate(method="UNIPROT")) -> sp
+  
+sp$method<-sp$method %>% factor(labels = c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec","Uniprot"))
+  
+sp<-sp %>% mutate(method.type = case_when(method %in% c("Deepgo","DeepgoPlus") ~ "DL",
+                            method == 'Hmmer' ~ "profile",
+                            method %in% c("Seqvec","T5") ~ "LM",
+                            method == "Uniprot"~"Uniprot"))
+
+sp<-sp %>% mutate(method.type = factor(method.type,levels = c("DL","profile","LM","Uniprot")))
+
+```
+
+
+### MF
+
+```{r}
+# tarda mucho en correr
+
+
+cal_sims<-function(df,godata,measure='Wang',combine='BMA'){
+  if(length(unique(df$method))>1){
+    df %>% mutate(method=as.character(method)) %>% 
+      nest(data=GOID) %>%
+      dplyr::select(method,data) %>%
+      map(~combn(x = .x, m = 2) %>%
+            t %>%
+            as_tibble()) %>%
+      imap_dfc(~set_names(x = .x, nm = paste(.y, seq(ncol(.x)), sep = "_"))) %>% mutate(sim=map2_dbl(data_1,data_2,mgoSim,godata,measure,combine)) %>%
+      dplyr::select(method_1,method_2,sim)
+  } else {
+      return(NULL)
+  }
+}
+
+db<-eval(parse(text=params$db))
+
+dmMF<-godata(db,ont="MF")
+
+sp %>% filter(ONTOLOGY=='Molecular Function') %>%
+  dplyr::select(UNIPROT_ID,method,GOID) %>%
+  nest(data=c(method,GOID)) %>%
+  mutate(a=future_map(data,cal_sims,dmMF,.progress = T)) %>%
+  unnest(a)   -> mf_ssim
+
+mf_ssim %>%
+  group_by(method_1,method_2)%>% 
+  dplyr::summarise(mean=mean(sim,na.rm=T)) %>%
+  pivot_wider(id_cols = method_1,names_from = method_2,values_from = mean) %>%
+  mutate(method_1=factor(method_1,levels=rev(c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec")))) %>%
+  arrange(method_1) %>%
+  dplyr::select(Uniprot,Seqvec,T5,Hmmer,DeepgoPlus)
+  
+```
+```{r}
+#plot the mean semantic similarity between methods and Uniprot
+mf_ssim %>% filter( method_2=='Uniprot') %>% 
+  ggplot(aes(method_1,sim,fill=method_1))+geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  
+  
+  
+  
+
+```
+
+```{r}
+mf_ssim %>% filter( method_2=='Uniprot') %>% 
+  ggplot(aes(sim,fill=method_1))+
+  geom_histogram()+
+  facet_wrap(~method_1,nrow=1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  xlab("Semantic Similarity")
+
+
+ggsave(paste0("mf_ssim_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+### BP
+
+```{r}
+dmBP<-godata(db,ont="BP")
+
+sp %>% filter(ONTOLOGY=='Biological Process') %>%
+  dplyr::select(UNIPROT_ID,method,GOID) %>%
+  nest(data=c(method,GOID)) %>%
+  mutate(a=future_map(data,cal_sims,dmMF,.progress = T)) %>%
+  unnest(a) %>% group_by(method_1,method_2)  -> bp_ssim
+
+bp_ssim %>%
+   dplyr::summarise(mean=mean(sim,na.rm=T)) %>%
+  pivot_wider(id_cols = method_1,names_from = method_2,values_from = mean) %>%
+  mutate(method_1=factor(method_1,levels=rev(c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec")))) %>%
+  arrange(method_1) %>%
+  dplyr::select(Uniprot,Seqvec,T5,Hmmer,DeepgoPlus)
+```
+
+```{r}
+bp_ssim %>% filter( method_2=='Uniprot') %>% 
+  ggplot(aes(method_1,sim,fill=method_1))+geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  ylab("Semantic Similarity")
+```
+  
+```{r}
+bp_ssim %>% filter( method_2=='Uniprot') %>% 
+  ggplot(aes(sim,fill=method_1))+
+  geom_histogram()+
+  facet_wrap(~method_1,nrow=1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  xlab("Semantic Similarity")
+
+ggsave(paste0("bp_ssim_",params$species,".pdf"),width=30,height=20,units = 'cm')
+
+```
+
+### CC
+
+```{r}
+
+dmCC<-godata(db,ont="CC")
+
+sp %>% filter(ONTOLOGY=='Cellular Component') %>%
+  dplyr::select(UNIPROT_ID,method,GOID) %>%
+  nest(data=c(method,GOID)) %>%
+  mutate(a=future_map(data,cal_sims,dmMF,.progress = T)) %>%
+  unnest(a) %>% group_by(method_1,method_2)  -> cc_ssim
+
+cc_ssim %>%
+   dplyr::summarise(mean=mean(sim,na.rm=T)) %>%
+  pivot_wider(id_cols = method_1,names_from = method_2,values_from = mean) %>%
+  mutate(method_1=factor(method_1,levels=rev(c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec")))) %>%
+  arrange(method_1) %>%
+  dplyr::select(Uniprot,Seqvec,T5,Hmmer,DeepgoPlus)
+```
+```{r}
+cc_ssim %>% filter( method_2=='Uniprot') %>% 
+  ggplot(aes(method_1,sim,fill=method_1))+geom_boxplot()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  ylab("Semantic Similarity")
+```
+
+```{r}
+cc_ssim %>% filter( method_2=='Uniprot') %>% 
+  ggplot(aes(sim,fill=method_1))+
+  geom_histogram()+
+  facet_wrap(~method_1,nrow=1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  xlab("Semantic Similarity")
+ggsave(paste0("cc_ssim_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+

@@ -1,0 +1,387 @@
+---
+title: "Scores"
+output: html_notebook
+params:
+  species: "MOUSE"
+  db: "org.Mm.eg.db"
+---
+
+```{=html}
+<!---
+
+para crear el report: 
+rmarkdown::render( "main scripts/scores.Rmd",output_file = "report_scores_DROME.html",params=list(species="DROME",db="org.Dm.eg.db")) 
+-->
+```
+
+```{r settings, echo = F, warning = F, error = F,message = F}
+
+library(tidyverse)
+library(furrr)
+library(GO.db)
+library(params$db,character.only=TRUE)
+
+knitr::opts_chunk$set(
+  'echo' = F, 'warning' = F, 'error' = F,'message' = F,'cache'=TRUE,'cache.lazy' = FALSE
+)
+
+
+furrr_options(globals = TRUE,  seed = T)
+plan(strategy = 'multisession', workers = 10)
+
+theme_set(theme_light()+theme(strip.text=element_text(size=20),axis.text=element_text(size=15),axis.title=element_text(size=15),legend.text=element_text(size=15),legend.title=element_text(size=15)))
+
+
+method_colors<- c("#999999","#56B4E9", "#009E73", "#E69F00", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+options(ggplot2.discrete.fill= method_colors)
+```
+
+```{r load_data}
+load(paste0("../big_tables/super_big_table_",params$species,".Rdata"))
+
+#super_big_table<-filter(super_big_table,!is.na(method))
+
+#all predictions
+
+prediction_files <- dir(path='../predictions',pattern=paste0(params$species,"_"),full.names = T)
+names(prediction_files) <- str_match(prediction_files,paste0(params$species,"_(.+).csv"))[,2]
+
+all_pred <- map_dfr(prediction_files,read_delim,delim=';',col_names= c("UNIPROT_ID","ONTOLOGY","GOID","TERM","SCORE"),.id = "method") %>%
+  mutate(UNIPROT_ID=str_match(UNIPROT_ID,"\\|(.+)\\|")[,2])
+
+
+all_pred<-all_pred %>% filter(!TERM %in% c("biological_process","molecular_function","cellular_component","all"))
+
+all_pred<-filter(all_pred,!method=='evaluefilter_PfamA')
+
+#all_predictions_compared_with_gold_standard
+
+terms<-select(GO.db,keys = keys(GO.db),columns = c("TERM","ONTOLOGY")) # %>%
+ # mutate(ONTOLOGY=case_when(ONTOLOGY == 'BP' ~ "Biological Process",
+ #                           ONTOLOGY == 'MF' ~ "Molecular Function",
+ #                           ONTOLOGY == 'CC' ~ "Cellular Component")) -> terms
+#GOLD
+
+gold_files<-dir(path='../gold/',pattern=paste0(params$species,"_"),full.names = T)
+
+gold<-map_dfr(gold_files,read_delim,delim=';',col_names=c('UNIPROT_ID','GOID')) %>%
+  separate_longer_delim(cols = GOID,delim = "|") %>% 
+  left_join(terms) 
+
+total_uni<-gold %>% pull(UNIPROT_ID) %>% unique() %>% length()
+
+gold<-gold%>% filter(!is.na(TERM))
+
+
+super_big_table %>% 
+  dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID.pred,TERM.pred,SCORE,results) %>%
+  mutate(val = TRUE) %>%
+  pivot_wider(names_from = results,values_from = val , values_fn = all ,values_fill = FALSE) %>% 
+  dplyr::select(-`NO RELATION`) %>% 
+  mutate("UNRELATED" = !(HIT | PARENT | CHILD | ANCESTOR | OFFSPRING)) %>% 
+  mutate(ONTOLOGY=case_when(ONTOLOGY == "Biological Process"~'BP' ,
+                            ONTOLOGY == "Molecular Function" ~'MF',
+                            ONTOLOGY == "Cellular Component"~'CC')) -> summary_predictions
+
+summary_predictions <-summary_predictions %>% filter(!is.na(method))
+
+summary_predictions$method<-summary_predictions$method %>% factor(labels = c("Deepgo","DeepgoPlus","HMMER","T5","Seqvec"))
+
+summary_predictions<-summary_predictions %>% mutate(method.type = case_when(method %in% c("Deepgo","DeepgoPlus") ~ "DL",
+                            method == 'HMMER' ~ "profile",
+                            method %in% c("Seqvec","T5") ~ "LM"))
+
+summary_predictions$method.type<- factor(summary_predictions$method.type,levels = c("DL","profile","LM"))
+
+summary_predictions %>% 
+  dplyr::select(UNIPROT_ID,method,method.type,ONTOLOGY,GOID=GOID.pred,TERM=TERM.pred,SCORE) %>%
+  bind_rows(gold %>% mutate(method="UNIPROT")) -> sp
+
+
+```
+
+
+```{r}
+
+sp %>% group_by(method,method.type,ONTOLOGY) %>% summarise(min=min(SCORE),max=max(SCORE),median=median(SCORE))
+```
+
+```{r}
+sp %>% filter(!method %in% c("UNIPROT","HMMER")) %>% ggplot(aes(SCORE))+
+  geom_histogram(aes(fill=method.type))+
+  facet_grid(ONTOLOGY~method,scales ='free_y') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggsave(paste0("scores_distribution_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+
+
+```{r}
+expand_grid(all_pred,cutoff=seq(0,1,.1)) %>% mutate(pass=SCORE>=cutoff) -> all_pred
+all_pred %>% filter(pass) -> all_pred
+```
+
+# coverage in annotations and proteins
+
+```{r}
+
+# quantile_df <- function(x, probs = c(0,0.25, 0.5, 0.75)) {
+#     f<-ecdf(x)
+#     tibble(
+#         val = 1-f(probs),
+#         quant = probs
+#     )
+# }
+# 
+# sp %>% 
+#   filter(! method %in% c("Hmmer",'UNIPROT' )) %>%
+#   reframe(quantile_df(SCORE),.by=c(method,ONTOLOGY)) %>%
+#   ggplot(aes(quant,val,color=method))+
+#   geom_line()+
+#   facet_wrap(~ONTOLOGY)+
+#   xlab('cutoff')+
+#   ylab('% remaining annotatons')+
+#   ylim(0,1)
+
+
+```
+
+
+
+# drop in hits, close and related
+
+
+
+
+# drop in number of proteins with predictions
+
+```{r}
+
+
+get_prots_for_quantile<- function(my_method,ontology,quantile) {
+  sp %>% filter(ONTOLOGY == ontology) %>%
+    filter(method == my_method) -> mydata
+  cutoff<-quantile(mydata$SCORE,quantile)
+  sp %>% filter(ONTOLOGY == ontology) %>%
+    filter(method %in% c(my_method)) %>% 
+    filter(SCORE >= cutoff  | method=='UNIPROT') %>%
+    mutate(quantile=quantile,cutoff=cutoff) %>%
+    dplyr::select(UNIPROT_ID,method,ONTOLOGY,quantile,cutoff) %>%
+    unique() %>% 
+    count(method,ONTOLOGY,quantile,cutoff)   -> res
+  return(res)
+}
+
+
+get_prots <- function(ontology,my_method,quantiles) {
+    res<-map(quantiles,~get_prots_for_quantile(quantile=.x,my_method=my_method,ontology=ontology)) %>%
+               list_rbind() 
+  return(res)
+}
+```
+
+
+
+```{r}
+ontologies = c("MF","BP","CC")
+methods<-c("T5","Seqvec","Deepgo","DeepgoPlus")
+combs <- expand.grid(ont = ontologies,method=methods)
+quantiles<-c(0,0.25,0.5,0.75)
+coverage_all <- map2(rep(ontologies,each=4),rep(methods,3),~get_prots(.x,.y,quantiles)) %>% list_rbind()
+write_tsv(coverage_all,paste0("coverage_quantiles_",params$species,".tsv"))
+
+```
+
+```{r}
+coverage_all %>% 
+  filter( quantile <1) %>% 
+  ggplot(aes(quantile,n,color=method))+
+  stat_summary()+
+  stat_summary(geom='line')+
+  facet_wrap(~ONTOLOGY)+
+  xlab('fraction of removed annotations')+
+  scale_x_continuous(limits=c(0,.75),breaks=seq(0,.75,0.25))+
+  ylab('proteins')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggsave(paste0("coverage_quantiles_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+
+# drop in information content
+
+
+```{r}
+library(GOSemSim)
+
+ontologies=c("MF","BP","CC")
+
+godata_list<-map(ontologies,~godata(params$db,ont=.x))
+names(godata_list)<-ontologies
+
+
+ic<-map_dfr(godata_list,~.x %>%
+    `@`("IC") %>%
+    stack() %>%
+    dplyr::select(GOID=ind,IC=values))
+
+```
+
+
+```{r}
+spic <- left_join(sp,ic) %>% filter(!method %in% c("UNIPROT","HMMER"))
+spic %>% group_by(ONTOLOGY,method) %>% mutate(quartile=cut(SCORE,quantile(SCORE),labels = F,include.lowest = T)) -> spic
+
+ggplot(spic,aes(quartile,IC, group=method,color=method))+
+  stat_summary()+
+  stat_summary(geom='line')+
+  facet_wrap(~ONTOLOGY)
+```
+
+```{r}
+
+get_ic_for_quantile<- function(my_method,ontology,quantile) {
+  spic %>% filter(ONTOLOGY == ontology) %>%
+    filter(method == my_method) -> mydata
+  cutoff<-quantile(mydata$SCORE,quantile)
+  spic %>% filter(ONTOLOGY == ontology) %>%
+    filter(method %in% c('UNIPROT',my_method)) %>% 
+    filter(SCORE >= cutoff  | method=='UNIPROT') %>%
+    dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID,SCORE,IC) %>% mutate(quantile=quantile,cutoff=cutoff)  -> res
+  return(res)
+}
+
+
+get_ic <- function(ontology,my_method,quantiles) {
+    res<-map(quantiles,~get_ic_for_quantile(quantile=.x,my_method=my_method,ontology=ontology)) %>%
+               list_rbind() %>%
+               dplyr::select(UNIPROT_ID,GOID,method,ONTOLOGY,SCORE,IC,quantile,cutoff,IC)
+  return(res)
+}
+```
+
+```{r}
+ontologies = c("MF","BP","CC")
+methods<-c("T5","Seqvec","Deepgo","DeepgoPlus")
+combs <- expand.grid(ont = ontologies,method=methods)
+quantiles<-c(0,0.25,0.5,0.75)
+ic_all <- map2(rep(ontologies,each=4),rep(methods,3),~get_ic(.x,.y,quantiles)) %>% list_rbind()
+write_tsv(ic_all,paste0("ic_quantiles_",params$species,".tsv"))
+```
+
+```{r}
+ic_all %>% 
+  filter( quantile <1) %>% 
+  ggplot(aes(quantile,IC,color=method))+
+  stat_summary()+
+  stat_summary(geom='line')+
+  facet_wrap(~ONTOLOGY)+
+  xlab('fraction of removed annotations')+
+  scale_x_continuous(limits=c(0,.75),breaks=seq(0,.75,0.25))+
+  ylab('IC')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggsave(paste0("ic_quantiles_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+
+
+```{r}
+cal_sims<-function(df,godata,measure='Wang',combine='BMA'){
+  if(length(unique(df$method))>1){
+    df %>% nest(data=GOID) %>%
+      dplyr::select(method,data) %>%
+      map(~combn(x = .x, m = 2) %>%
+            t %>%
+            as_tibble) %>%
+      imap_dfc(~set_names(x = .x, nm = paste(.y, seq(ncol(.x)), sep = "_"))) %>%
+      filter(method_1=="UNIPROT" | method_2=="UNIPROT") %>%
+      mutate(sim=map2_dbl(data_1,data_2,mgoSim,godata,measure,combine)) %>%
+      dplyr::select(method_1,method_2,sim)
+  } else {
+      return(NULL)
+  }
+}
+
+db<-eval(parse(text=params$db))
+
+get_ss_for_df <- function(ontology, df) {
+    gd<-godata_list[[ontology]]
+    df %>%
+      mutate(a=future_map(data,cal_sims,gd,.progress = TRUE)) %>%
+      unnest(a)  -> mf_ssim
+    return(mf_ssim)
+  }
+
+get_ss_for_cutoff<-function(my_method,ontology,cutoff){
+  message(paste("getting ss for",ontology,my_method,cutoff))
+  sp %>% filter(ONTOLOGY == ontology) %>%
+    filter(method %in% c('UNIPROT',my_method)) %>% 
+    filter(SCORE >= cutoff  | method=='UNIPROT') %>%
+    dplyr::select(UNIPROT_ID,method,GOID) %>%
+    nest(data=c(method,GOID)) -> df
+  
+  get_ss_for_df(ontology,df)
+}
+
+get_ss_for_quantile<- function(my_method,ontology,quantile) {
+  sp %>% filter(ONTOLOGY == ontology) %>%
+    filter(method == my_method) -> mydata
+    score<-quantile(mydata$SCORE,quantile)
+    res<-get_ss_for_cutoff(cutoff=score,my_method=my_method,ontology=ontology) %>% mutate(cutoff=score)
+    return(res)
+}
+
+get_ss<- function(ontology,my_method,quantiles) {
+  #(paste("getting ss for",ontology,my_method))
+  res<-map(quantiles,~get_ss_for_quantile(quantile=.x,my_method=my_method,ontology=ontology) %>% mutate(ontology=ontology,quantile=.x)) %>% list_rbind() %>% dplyr::select(UNIPROT_ID,method=method_1,ontology,quantile,cutoff,sim)
+  return(res)
+  
+}
+
+```
+
+
+```{r}
+# quantiles<-c(0,.25,.5,.75,1)
+# ontology='MF'
+# my_method='T5'
+# res<-get_ss(my_method=my_method ,ontology=ontology,quantiles=quantiles)
+# res %>%
+#   ggplot(aes(quantile,sim,color='method'))+
+#   stat_summary()+
+#   stat_summary(geom='line')+
+#   facet_wrap(~ontology)+
+#   xlab('cutoff')+
+#   ylab('Semantic Similarity')
+```
+
+```{r}
+# ontologies = c("MF","BP","CC")
+# methods<-c("T5","Seqvec","Deepgo","DeepgoPlus")
+# combs <- expand.grid(ont = ontologies,method=methods)
+# quantiles<-c(0,0.25,0.5,0.75)
+# ss_all <- map2(rep(ontologies,each=4),rep(methods,3),~get_ss(.x,.y,quantiles)) %>% list_rbind()
+# write_tsv(ss_all,paste0("scores_quantiles_",params$species,".tsv"))
+
+ss_all<-read_tsv(paste0("scores_quantiles_",params$species,".tsv"))
+```
+
+```{r}
+ss_all %>% 
+ filter( quantile <1) %>% 
+  ggplot(aes(quantile,sim,color=method))+
+  stat_summary()+
+  stat_summary(geom='line')+
+  facet_wrap(~ontology)+
+  ylab('Semantic Similarity')+
+  xlab('fraction of removed annotations')+
+  scale_x_continuous(limits=c(0,.75),breaks=seq(0,.75,0.25))+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggsave(paste0("ss_quantiles_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+

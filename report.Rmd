@@ -1,0 +1,648 @@
+---
+title: "REPORT"
+output:
+  html_document:
+    df_print: paged
+params:
+  species: "MOUSE"
+  db: "org.Mm.eg.db"
+---
+
+```{=html}
+<!---
+
+para crear el report: 
+rmarkdown::render( "main scripts/report.Rmd",output_file = "report_DROME.html",params=list(species="DROME",db="org.Dm.eg.db")) 
+-->
+```
+# Automatic Annotation for `r params$species`
+
+```{r settings, echo = F, warning = F, error = F,message = F}
+
+library(tidyverse)
+library(furrr)
+library(GO.db)
+library(params$db,character.only=TRUE)
+
+knitr::opts_chunk$set(
+  echo = F, warning = F, error = F,message = F,cache=TRUE,cache.lazy = FALSE
+)
+
+
+furrr_options(globals = TRUE,  seed = T)
+plan(strategy = 'multisession', workers = 10)
+
+theme_set(theme_light()+theme(strip.text=element_text(size=20),axis.text=element_text(size=15),axis.title=element_text(size=15),legend.text=element_text(size=15),legend.title=element_text(size=15)))
+
+method_colors<- c("#999999","#56B4E9", "#009E73", "#E69F00", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+options(ggplot2.discrete.fill= method_colors)
+```
+
+## Gold Standard (UNIPROT)
+
+```{r load_data}
+load(paste0("../big_tables/super_big_table_",params$species,".Rdata"))
+
+#super_big_table<-filter(super_big_table,!is.na(method))
+
+#all predictions
+
+prediction_files <- dir(path='../predictions',pattern=paste0(params$species,"_"),full.names = T)
+names(prediction_files) <- str_match(prediction_files,paste0(params$species,"_(.+).csv"))[,2]
+
+all_pred <- map_dfr(prediction_files,read_delim,delim=';',col_names= c("UNIPROT_ID","ONTOLOGY","GOID","TERM","SCORE"),.id = "method") %>%
+  mutate(UNIPROT_ID=str_match(UNIPROT_ID,"\\|(.+)\\|")[,2])
+
+
+all_pred<-all_pred %>% filter(!TERM %in% c("biological_process","molecular_function","cellular_component","all"))
+
+
+
+
+all_pred$ONTOLOGY<-all_pred$ONTOLOGY %>% factor(labels = c("BP","CC","MF"))
+#all_predictions_compared_with_gold_standard
+
+
+select(GO.db,keys = keys(GO.db),columns = c("TERM","ONTOLOGY"))  -> terms #%>%
+#  mutate(ONTOLOGY=case_when(ONTOLOGY == 'BP' ~ "Biological Process",
+#                            ONTOLOGY == 'MF' ~ "Molecular Function",
+#                            ONTOLOGY == 'CC' ~ "Cellular Component")) 
+
+
+#GOLD
+gold_files<-dir(path='../gold',pattern=paste0(params$species,"_"),full.names = T)
+
+gold_all<-map_dfr(gold_files,read_delim,delim=';',col_names=c('UNIPROT_ID','GOID')) %>%
+  separate_longer_delim(cols = GOID,delim = "|") %>% 
+  left_join(terms) 
+
+
+total_uni <- gold_all %>% pull(UNIPROT_ID) %>% unique() %>% length()
+
+gold_not_general<-gold_all %>% filter(!TERM %in% c("biological_process","molecular_function","cellular_component","all"))
+
+gold<-gold_not_general %>% filter(!is.na(TERM)) %>% mutate(method="Uniprot",SCORE=NA,method.type="Uniprot")
+
+all_pred<-all_pred %>% bind_rows(gold)
+
+all_pred$method<-all_pred$method %>% factor(labels = c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec","Uniprot"))
+
+all_pred<-all_pred %>% mutate(method.type = case_when(method %in% c("Deepgo","DeepgoPlus") ~ "DL",
+                            method == 'Hmmer' ~ "profile",
+                            method %in% c("Seqvec","T5") ~ "LM",
+                            method == "Uniprot"~"Uniprot"))
+
+all_pred<-all_pred %>% mutate(method.type = factor(method.type,levels = c("DL","profile","LM","Uniprot")))
+```
+
+### Annotated proteins by Uniprot (Gold Standard)
+
+```{r}
+db<-eval(parse(text=params$db))
+dbgenes<-keys(db)
+if ("GENETYPE" %in% columns(db)) {
+  genome<-AnnotationDbi::select(db,keys=dbgenes,columns=c("ENTREZID","GENETYPE","UNIPROT","GO"))
+
+} else {
+  genome<-AnnotationDbi::select(db,keys=dbgenes,columns=c("ENTREZID","UNIPROT","GO"))
+}
+```
+
+```{r}
+if ("GENETYPE" %in% columns(db)){
+  genome %>% dplyr::select("ENTREZID","GENETYPE") %>% distinct() %>% group_by(GENETYPE) %>% count()
+}
+```
+
+```{r}
+if ("GENETYPE" %in% columns(db)){
+  prot_cod <- genome %>% filter(GENETYPE=='protein-coding') %>% pull(ENTREZID) %>% unique() %>% length
+  prot_cod_uniprot <- genome %>% filter(GENETYPE=='protein-coding',!is.na(UNIPROT)) %>% pull(ENTREZID) %>% unique() %>% length()
+  prot_cod_uniprot_nogo <- genome %>% filter(GENETYPE=='protein-coding',!is.na(UNIPROT),is.na(GO)) %>%   pull(ENTREZID) %>% unique() %>% length()
+} else {
+  prot_cod <- NA
+  prot_cod_uniprot <- genome %>% filter(!is.na(UNIPROT)) %>% pull(ENTREZID) %>% unique() %>% length()
+  prot_cod_uniprot_nogo <- genome %>% filter(!is.na(UNIPROT),is.na(GO)) %>%   pull(ENTREZID) %>% unique() %>% length()
+}
+
+```
+
+PROT CODING GENES-\> `r prot_cod`
+
+PROT CODING GENES IN UNIPROT-\> `r prot_cod_uniprot`
+
+PROT CODING GENES IN UNIPROT NO GO-\> `r prot_cod_uniprot_nogo`
+
+TOTAL PROTS IN UNI \<- `r total_uni`
+
+```{r}
+gold %>%
+  group_by(ONTOLOGY) %>%
+  summarize(annotated_proteins=length(unique(UNIPROT_ID)),annotations=n(),annotations_per_protein=annotations/annotated_proteins)
+```
+
+```{r}
+ggplot(gold %>% dplyr::select(UNIPROT_ID,ONTOLOGY) %>% distinct(),aes(ONTOLOGY,fill=ONTOLOGY))+
+  geom_bar()+ylab("Proteins")+
+  scale_fill_manual(values=c('red','navy','darkgreen'),guide=NULL)
+```
+
+### Total Annotations by Uniprot (Gold Standard)
+
+```{r}
+ggplot(gold,aes(ONTOLOGY,fill=ONTOLOGY))+
+  geom_bar()+ylab("Annotations")+
+  scale_fill_manual(values=c('red','navy','darkgreen'),guide=NULL)#+
+  #ggtitle(paste0(params$species," UNIPROT Annotations"))
+```
+
+## Predicciones
+
+```{r}
+all_pred %>%
+  dplyr::select(method,UNIPROT_ID,ONTOLOGY) %>%
+  distinct() %>% 
+  group_by(method,ONTOLOGY) %>% 
+  count() %>%
+  pivot_wider(names_from = ONTOLOGY,values_from = n) %>% 
+  knitr::kable(caption="Annotated proteins by Method and Ontology")
+```
+
+```{r}
+ggplot(all_pred %>% dplyr::select(method,method.type,UNIPROT_ID,ONTOLOGY) %>% distinct(),aes(method,fill=method.type))+
+  geom_bar()+ylab("Proteins")+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  facet_wrap(~ONTOLOGY)+
+  #ggtitle("Annotated proteins per method and ontology")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  xlab('')
+  
+  ggsave(paste0("annotated_proteins_per_method_and_ontology",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+```{r}
+
+
+prots_in_annot_not_in_gold<-all_pred %>% filter(method!='Uniprot',!UNIPROT_ID %in% gold$UNIPROT_ID) %>%
+  pull(UNIPROT_ID) %>% unique()
+
+all_pred_unite <- all_pred %>%
+  filter(method!='Uniprot',!UNIPROT_ID %in% prots_in_annot_not_in_gold) %>%
+  unite(uni_ont,UNIPROT_ID,ONTOLOGY)
+
+
+gold_unite<-gold %>%
+  dplyr::select(UNIPROT_ID,ONTOLOGY) %>%
+  distinct() %>%
+  unite(uni_ont,UNIPROT_ID,ONTOLOGY)
+
+all_pred_unite %>% 
+  filter(!uni_ont %in% gold_unite$uni_ont) %>% 
+  separate(uni_ont,into = c("UNIPROT_ID","ONTOLOGY"),sep = "_") %>%
+  distinct()  -> in_annot_not_in_prot
+
+write_tsv(in_annot_not_in_prot,paste0(params$species,"_annotated_by_methods_not_by_gold.tsv "))
+
+in_annot_not_in_prot %>%
+  dplyr::select(UNIPROT_ID,ONTOLOGY,method) %>% 
+  unique() %>% 
+  count(ONTOLOGY,method) %>%
+  pivot_wider(names_from = ONTOLOGY,values_from = n) %>% 
+  knitr::kable(caption="Annotated proteins by Method and Ontology Not annotated by Uniprot")
+```
+
+```{r}
+ggplot(in_annot_not_in_prot %>%
+  dplyr::select(UNIPROT_ID,ONTOLOGY,method,method.type) %>% 
+  unique(),
+       aes(method,fill=method.type))+
+  geom_bar()+ylab("Proteins")+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  facet_wrap(~ONTOLOGY)+
+  #ggtitle("Annotated proteins per method and ontology NOT annotated by Uniprot")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  xlab('')
+
+ ggsave(paste0("Annotated_proteins_per_method_and_ontology_NOT_annotated_by_Uniprot_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+```{r}
+gold_unite %>% 
+  filter(!uni_ont %in% all_pred_unite$uni_ont) %>% 
+  separate(uni_ont,into = c("UNIPROT_ID","ONTOLOGY")) %>%
+  distinct() %>%
+  count(ONTOLOGY)  %>% 
+  knitr::kable(caption="Annotated proteins by Method and Ontology  annotated by Uniprot and not by methods")
+```
+
+```{r}
+all_pred  %>%
+  dplyr::select(method,UNIPROT_ID,GOID,ONTOLOGY) %>%
+  distinct() %>% 
+  group_by(method,ONTOLOGY) %>% 
+  count() %>%
+  pivot_wider(names_from = ONTOLOGY,values_from = n) %>% 
+  knitr::kable(caption="Annotations by Method and Ontology",format = 'html')
+```
+
+```{r}
+ggplot(all_pred %>%
+         dplyr::select(method,method.type,UNIPROT_ID,GOID,ONTOLOGY) %>%
+         distinct(),
+       aes(method,fill=method.type))+
+  geom_bar()+ylab("Annotations")+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  facet_wrap(~ONTOLOGY)+
+  #ggtitle("Total Annotations for Method and Ontology")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  xlab('')
+  
+  ggsave(paste0("total_annotations_per_method_and_ontology",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+```{r}
+ggplot(all_pred %>%
+         dplyr::select(method,method.type,UNIPROT_ID,GOID,ONTOLOGY) %>%
+         distinct(),
+       aes(method,fill=method.type))+
+  geom_bar()+ylab("Annotations")+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  facet_wrap(~ONTOLOGY,scales = 'free')+
+  #ggtitle("Total Annotations for Method and Ontology")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  xlab('')#+
+ # ylim(NA,400000)
+ ggsave(paste0("total_annotations_per_method_and_ontology",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+### Predictions per Protein per method
+
+```{r}
+  all_pred %>%
+  group_by(method,UNIPROT_ID,ONTOLOGY) %>%
+  summarise(count_preds=length(unique(GOID))) %>%
+  group_by(method,ONTOLOGY) %>% summarise(mean=median(count_preds))  %>%
+    pivot_wider(id_cols = method,names_from = ONTOLOGY,values_from = mean )
+
+ all_pred %>%
+  group_by(method,method.type,UNIPROT_ID,ONTOLOGY) %>%
+  summarise(count_preds=length(unique(GOID))) %>%
+   ggplot(aes(method,count_preds))+
+  geom_boxplot(aes(fill=method.type,),alpha=.4,outlier.color = 'lightgray')+
+  facet_wrap(~ONTOLOGY,ncol = 3,scales='free')+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  ylab("Predictions")+
+  xlab('')+
+  coord_cartesian(ylim=c(0,100))
+                                          
+```
+
+```{r}
+super_big_table %>% 
+  dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID.pred,TERM.pred,results) %>%
+  mutate(val = TRUE) %>%
+  pivot_wider(names_from = results,values_from = val , values_fn = all ,values_fill = FALSE) %>% 
+  dplyr::select(-`NO RELATION`) %>% 
+  mutate("UNRELATED" = !(HIT | PARENT | CHILD | ANCESTOR | OFFSPRING)) -> summary_predictions
+
+summary_predictions$method<-summary_predictions$method %>% factor(labels = c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec"))
+
+summary_predictions<-summary_predictions %>% mutate(method.type = case_when(method %in% c("Deepgo","DeepgoPlus") ~ "DL",
+                            method == 'Hmmer' ~ "profile",
+                            method %in% c("Seqvec","T5") ~ "LM"))
+summary_predictions$method.type<- factor(summary_predictions$method.type,levels = c("DL","profile","LM"))
+
+summary_predictions$ONTOLOGY<-summary_predictions$ONTOLOGY %>% factor(labels = c("BP","CC","MF"))
+
+```
+
+```{r}
+
+summary_predictions <-summary_predictions %>% filter(!is.na(method))
+```
+
+### Predictions per methods on Uniprot annotated proteins
+
+```{r}
+summary_predictions %>% group_by(method,method.type,ONTOLOGY) %>% summarise(predictions=n(),proteins=length(unique(UNIPROT_ID)),predictions_per_prot=predictions/proteins) -> predictions_per_method 
+predictions_per_method %>% pivot_wider(id_cols = c(method,method.type),names_from = ONTOLOGY,values_from = c(predictions))
+```
+
+```{r}
+ggplot(predictions_per_method ,aes(method,predictions))+
+  geom_col(aes(fill=method.type))+
+  facet_wrap(~ONTOLOGY)+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  ylab("Predictions")+
+  xlab('')
+```
+
+```{r}
+```
+
+### Proteins among Uniprot annotated proteins with predicted function per method
+
+```{r}
+predictions_per_method %>% pivot_wider(id_cols = c(method,method.type),names_from = ONTOLOGY,values_from = c(proteins))
+
+ggplot(predictions_per_method ,aes(method,proteins))+
+  geom_col(aes(fill=method.type))+
+  facet_wrap(~ONTOLOGY)+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  ylab("proteins")+
+  xlab('')
+```
+
+### Tipo de prediccion segun precision para cada metodo
+
+```{r summary_prediction_best}
+
+summary_predictions %>%
+  mutate(best=if_else(HIT,"HIT",
+                      if_else(PARENT | CHILD,"CLOSE",
+                              if_else(ANCESTOR | OFFSPRING,"RELATED","UNRELATED")))) %>%
+  dplyr::select(UNIPROT_ID,method,method.type,ONTOLOGY,GOID.pred,TERM.pred,best) %>% 
+  mutate(best=factor(best,levels=c("HIT","CLOSE","RELATED","UNRELATED")))  -> summary_predictions_best
+
+write_tsv(summary_predictions_best,paste0("summary_predictions_best_",params$species,".tsv"))
+
+ggplot(summary_predictions_best,aes(method,fill=best))+
+  geom_bar(position=position_fill())+
+  scale_fill_brewer(palette="Blues",name="type of prediction",direction = -1)+
+  facet_wrap(~ONTOLOGY)+
+  scale_y_continuous(breaks = c(0,.25,.5,.75,1), 
+                     labels = scales::percent(c(0,.25,.5,.75,1)))+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+
+ggsave(paste0("precision_per_method_fill_",params$species,".pdf"),width=30,height=20,units="cm")
+```
+
+```{r}
+
+
+ggplot(summary_predictions_best,aes(method,fill=best))+
+  geom_bar(position=position_stack())+
+  scale_fill_brewer(palette="Blues",name="type of prediction",direction = -1)+
+  facet_wrap(~ONTOLOGY,scales = 'free_y')+
+  ylab("Predictions")+
+  xlab("")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+ggsave(paste0("precision_per_method_",params$species,".pdf"),width=30,height=20,units="cm")
+```
+
+# Terminos usados por cada método
+
+```{r terms_per_method}
+summary_predictions  %>%  group_by(method,method.type,ONTOLOGY) %>% summarise(terms=length(unique(GOID.pred))) -> terms_per_method
+terms_per_method %>% pivot_wider(id_cols = c(method,method.type),names_from = ONTOLOGY,values_from = c(terms))
+
+ggplot(terms_per_method ,aes(method,terms))+
+  geom_col(aes(fill=method.type))+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  facet_wrap(~ONTOLOGY)+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  ylab("Terms")+
+  xlab('')
+```
+
+### Information content per annotation per method
+
+```{r}
+library(GOSemSim)
+ic<-map_dfr(c("CC","BP","MF"),~godata(db,ont=.x) %>%
+  `@`("IC") %>%
+    stack() %>%
+    dplyr::select(GOID.pred=ind,IC=values))
+
+summary_predictions <- left_join(summary_predictions,ic)
+
+summary_predictions<-summary_predictions %>% mutate(IC=if_else(is.infinite(IC),max(IC),IC))
+
+summary_predictions %>% 
+  ggplot(aes(method,IC))+
+  geom_boxplot(aes(fill=method.type,),alpha=.4,outlier.color = 'lightgray')+
+  facet_wrap(~ONTOLOGY,ncol = 3,scales='free')+
+  scale_fill_manual(values=method_colors,guide=NULL)+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  ylab("IC")+
+  xlab('')
+
+
+write.table(summary_predictions %>% dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID.pred,TERM.pred,IC),file=paste0("ic_predictions",params$species,".tsv"),sep="\t",quote=F,row.names=F)
+
+ ggsave(paste0("information_content_boxplot_",params$species,".pdf"),width=30,height=20,units = 'cm')
+ 
+ 
+ 
+```
+
+## coverage de anotaciones
+
+número de genes según que porcentaje de predicciones que coinciden con una anotación ( hit, close or related)
+
+```{r}
+
+summary_predictions_best  %>% 
+  group_by(UNIPROT_ID,method,ONTOLOGY) %>% 
+  summarise(annotations=n(), 
+            guessed=sum(best=='HIT')/annotations*100, 
+            at_least_close=sum( best== 'CLOSE' | best=='HIT')/annotations*100,
+            at_least_related=sum( best=='RELATED' | best== 'CLOSE' | best=='HIT')/annotations*100,
+            missed=sum(best=='MISS')/annotations*100) -> summary_best_predictions_by_gene
+
+summary_best_predictions_by_gene  %>%
+  dplyr::select(-annotations,-missed) %>% 
+  pivot_longer(cols=4:6,names_to = 'precission',values_to = 'value') %>% 
+  mutate(precission=factor(precission,levels=c("guessed","at_least_close","at_least_related")))-> summary_best_predictions_by_gene_long
+
+
+
+ggplot(summary_best_predictions_by_gene_long,aes(method,fill=cut(value,breaks = c(-1,0,20,40,60,80,100))))+
+  geom_bar()+
+  facet_grid(precission~ONTOLOGY)+
+  coord_flip()+
+  scale_fill_brewer(palette="Purples",name="percentage of predicted functions",
+                    labels=c(0,"0<x<=20%","20<x<=40%","40<x<=60%","60<x<=80%","80<x<=100%")) +
+  ylab("# of proteins")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+
+ggsave(paste0("coverage_of_function_predictions_per_method_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+la misma pero con position_fill
+
+```{r}
+ggplot(summary_best_predictions_by_gene_long,aes(method,fill=cut(value,breaks = c(-1,0,20,40,60,80,100))))+
+  geom_bar(position = position_fill())+
+  facet_grid(precission~ONTOLOGY)+
+  coord_flip()+
+  scale_fill_brewer(palette="Blues",name="percentage of predicted functions",
+                    labels=c(0,"0<x<=20%","20<x<=40%","40<x<=60%","60<x<=80%","80<x<=100%")) +
+  ylab("% of proteins")+
+  scale_y_continuous(breaks = c(0,.25,.5,.75,1), 
+                     labels = scales::percent(c(0,.25,.5,.75,1)))+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+
+
+```
+
+## Solapamiento entre predicciones
+
+```{r}
+
+# summary_predictions %>% 
+#   dplyr::select(UNIPROT_ID,method,ONTOLOGY,GOID=GOID.pred,TERM=TERM.pred) %>% 
+#   bind_rows(gold %>% mutate(method="UNIPROT")) -> sp
+# 
+# sp %>% pivot_wider(id_cols = c(UNIPROT_ID,ONTOLOGY,TERM),names_from = method, values_from=GOID,values_fn = function(x){return(1)},values_fill = F) %>% as.data.frame() -> df
+```
+
+### BP
+
+```{r}
+# library(UpSetR)
+# upset(df %>% filter(ONTOLOGY=='Biological Process'),nintersects = NA,nsets = 6)
+```
+
+### MF
+
+```{r}
+# upset(df %>% filter(ONTOLOGY=='Molecular Function'),nsets=6,nintersects = NA)
+```
+
+### CC
+
+```{r}
+# upset(df %>% filter(ONTOLOGY=='Cellular Component'),nsets=6,nintersects = NA)
+```
+
+## Anotaciones
+
+```{r annotation_summarised_data}
+
+super_big_table %>% 
+  dplyr::select(UNIPROT_ID,method,GOID.gold,TERM.gold,ONTOLOGY,results) %>%
+  mutate(val = TRUE) %>%
+  pivot_wider(names_from = results,values_from = val , values_fn = all ,values_fill = FALSE) %>% 
+  dplyr::select(-`NO RELATION`) %>% 
+  mutate("MISS" = !(HIT | PARENT | CHILD | ANCESTOR | OFFSPRING)) -> summary_annotations
+
+summary_annotations <-summary_annotations %>% filter(!is.na(method))
+
+summary_annotations$method<-summary_annotations$method %>% factor(labels = c("Deepgo","DeepgoPlus","Hmmer","T5","Seqvec"))
+
+summary_annotations<-summary_annotations %>% mutate(method.type = case_when(method %in% c("Deepgo","DeepgoPlus") ~ "DL",
+                            method == 'Hmmer' ~ "profile",
+                            method %in% c("Seqvec","T5") ~ "LM"))
+
+summary_annotations$ONTOLOGY <- factor(summary_annotations$ONTOLOGY,labels =   c("BP","MF","CC"))
+
+summary_annotations$method.type<- factor(summary_annotations$method.type,levels = c("DL","profile","LM"))
+
+summary_annotations %>%
+  mutate(best=if_else(HIT,"HIT",
+                      if_else(PARENT | CHILD,"CLOSE",
+                              if_else(ANCESTOR | OFFSPRING,"RELATED","MISS")))) %>%
+  dplyr::select(UNIPROT_ID,method,method.type,ONTOLOGY,GOID.gold,TERM.gold,,best) %>% 
+  mutate(best=factor(best,levels=c("HIT","CLOSE","RELATED","MISS")))  -> summary_annotations_best
+
+  
+summary_annotations_best  %>% 
+    group_by(UNIPROT_ID,method,method.type,ONTOLOGY) %>% 
+    summarise(annotations=n(), 
+              guessed=sum(best=='HIT')/annotations*100, 
+              at_least_close=sum( best== 'CLOSE' | best=='HIT')/annotations*100,
+              at_least_related=sum( best=='RELATED' | best== 'CLOSE' | best=='HIT')/annotations*100,
+              missed=sum(best=='MISS')/annotations*100) -> summary_best_annotations_by_gene
+  
+summary_best_annotations_by_gene  %>%
+    dplyr::select(-annotations,-missed) %>% 
+    pivot_longer(cols=5:7,names_to = 'precission',values_to = 'value') %>% 
+  mutate(precission=factor(precission,levels=c("guessed","at_least_close","at_least_related")))-> summary_annotations_by_gene_long
+```
+
+### Numero de anotaciones que predice cada metodo segun precision
+
+```{r}
+
+ggplot(summary_annotations_best,aes(method,fill=best))+
+  geom_bar(position=position_stack())+
+  scale_fill_brewer(palette="Blues",name="type of prediction",direction = -1)+
+  facet_wrap(~ONTOLOGY)+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+
+```
+
+la misma con position fill
+
+```{r}
+
+ggplot(summary_annotations_best,aes(method,fill=best))+
+  geom_bar(position=position_fill())+
+  scale_fill_brewer(palette="Blues",name="type of prediction",direction = -1)+
+  facet_wrap(~ONTOLOGY)+
+  scale_y_continuous(breaks = c(0,.25,.5,.75,1), 
+                     labels = scales::percent(c(0,.25,.5,.75,1)))+
+  ylab("")+
+  xlab("")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+```
+
+## coverage de anotaciones
+
+numero de genes segun que porcentaje de anotationces se predicen ( hit, close or related)
+
+```{r}
+ggplot(summary_annotations_by_gene_long,aes(method,fill=cut(value,breaks = c(-1,0,20,40,60,80,100))))+
+  geom_bar(position = position_stack())+
+  facet_grid(precission~ONTOLOGY)+
+  coord_flip()+
+  scale_fill_brewer(palette="Purples",name="percentage of annotated functions",
+                    labels=c(0,"0<x<=20%","20<x<=40%","40<x<=60%","60<x<=80%","80<x<=100%")) +
+  ylab("# of proteins")+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+
+ggsave(paste0("coverage_of_protein_annotations_per_method_",params$species,".pdf"),width=30,height=20,units = 'cm')
+```
+
+```{r}
+ggplot(summary_annotations_by_gene_long,aes(method,fill=cut(value,breaks = c(-1,0,20,40,60,80,100))))+
+  geom_bar(position = position_fill())+
+  facet_grid(precission~ONTOLOGY)+
+  coord_flip()+
+  scale_fill_brewer(palette="Blues",name="percentage of predicted functions",
+                    labels=c(0,"0<x<=20%","20<x<=40%","40<x<=60%","60<x<=80%","80<x<=100%")) +
+  ylab("% of proteins")+
+  scale_y_continuous(breaks = c(0,.25,.5,.75,1), 
+                     labels = scales::percent(c(0,.25,.5,.75,1)))+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))
+```
+
+## Proteins for which there is at least one hit predicted
+
+```{r}
+summary_annotations_best %>% 
+    group_by(UNIPROT_ID,method,method.type,ONTOLOGY) %>% 
+    summarise(at_least_on_hit=any(best=='HIT')) %>% group_by(method,method.type,ONTOLOGY) %>% summarise(sum=sum(at_least_on_hit)) -> prots_with_hits
+
+
+prots_with_hits %>% pivot_wider(id_cols = c(method,method.type),names_from = ONTOLOGY,values_from = sum) 
+
+```
+
+```{r}
+ggplot(prots_with_hits,aes(method,sum))+
+  geom_col(aes(fill=method.type))+
+  facet_wrap(~ONTOLOGY)+
+  theme(axis.text.x = element_text(angle=90,hjust = 1))+
+  ylab("Proteins")+
+  ylim(0,NA)+
+  xlab('')
+```
