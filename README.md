@@ -1,11 +1,12 @@
 ﻿
 ### Func-LM Repository
 
-This repository contains supplementary tables from our preprint: [Preprint Link](https://www.biorxiv.org/content/10.1101/2024.02.14.580341v1)
+This repository contains information from our preprint: [Preprint Link](https://www.biorxiv.org/content/10.1101/2024.02.14.580341v1)
+Data and results are here https://zenodo.org/records/10993618
 
 For any queries, please open an issue on GitHub or contact the CBBIO Group.
 
-**Author Contact**: a.rojas.m@csic.es please open an issue on GitHub or contact the repository owners. 
+**Author Contact**: a.rojas.m@csic.es or icases@gmail.com please open an issue on GitHub or contact the repository owners. 
 
 ---
 
